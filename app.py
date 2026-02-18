@@ -16,6 +16,7 @@ import streamlit as st
 import datetime as dt
 import altair as alt
 from pathlib import Path
+import urllib.parse  # for mailto links
 
 # Page setup
 st.set_page_config(page_title="Asset Dashboard", layout="wide")
@@ -47,7 +48,7 @@ def to_b64(path: Path | None) -> str | None:
 
 # Theme & logo pick (theme.base is "dark" or "light")
 _theme = st.get_option("theme.base")
-is_dark = (_theme == "dark")  # lowercase "dark"
+is_dark = (_theme == "dark")
 
 LIGHT_LOGO = resolve_logo("assetslogo_light.png")
 DARK_LOGO  = resolve_logo("assetslogo_dark.png")
@@ -104,7 +105,6 @@ if logo_src:
         unsafe_allow_html=True
     )
 else:
-    # Fallback if the file can't be found/read
     st.markdown(
         """
         <div class="app-topbar">
@@ -119,11 +119,12 @@ DEFAULT_EXCEL_PATH = "assetlist.xlsx"
 DEFAULT_SHEET_NAME = "Sheet1"
 
 # Auto-detection candidates
-USER_CANDIDATES = ["USER", "ASSIGNEE", "ASSIGNED_TO", "OWNER", "USERNAME", "EMPLOYEE", "EMAIL"]
+USER_CANDIDATES = ["USER", "ASSIGNEE", "ASSIGNED_TO", "OWNER", "USERNAME", "EMPLOYEE", "EMAIL", "EMPNAME", "EMPID"]
 AGE_CANDIDATES = ["AGE", "ASSET_AGE_YEARS"]
 PURCHASE_DATE_CANDIDATES = ["PURCHASE_DATE", "BUY_DATE", "PO_DATE", "INVOICE_DATE", "PROCUREMENT_DATE"]
 ASSET_ID_CANDIDATES = ["ASSETNO", "ASSET_NO", "ASSET_NUMBER", "ASSET_ID"]
 SERIAL_ID_CANDIDATES = ["SRNO", "SERIAL", "SERIAL_NO", "SERIALNUMBER"]
+EMAIL_CANDIDATES = ["EMAIL", "MAIL", "USER_EMAIL", "WORK_EMAIL", "E_MAIL"]  # NEW
 
 # Preferred Results table order (includes EMPNAME & EMPID)
 PREFERRED_DISPLAY_COLUMNS = [
@@ -191,6 +192,7 @@ def load_data(path_or_buffer, sheet):
     purchase_col = guess_column(df, PURCHASE_DATE_CANDIDATES)
     asset_id_col = guess_column(df, ASSET_ID_CANDIDATES)
     serial_id_col = guess_column(df, SERIAL_ID_CANDIDATES)
+    email_col = guess_column(df, EMAIL_CANDIDATES)  # NEW
 
     # Fallback for user_col to EMPNAME/EMPID if no user-like column detected
     if user_col is None:
@@ -208,12 +210,15 @@ def load_data(path_or_buffer, sheet):
     if age_col and age_col in df.columns:
         df[age_col] = to_numeric_safe(df[age_col])
 
-    # Clean text columns (including EMPNAME/EMPID, SUBCAT, ITEMTYPE)
+    # Clean text columns (including EMPNAME/EMPID, SUBCAT, ITEMTYPE, EMAIL)
     text_cols_to_clean = [
         "MAKE", "MODEL", "CITY", "COUNTRY", "SUBLOC", "LEVEL",
         "LOCNAME", "SEATNO", "STATUS", "USER", "ASSIGNEE", "ASSIGNED_TO", "OWNER", "CAT",
         "EMPNAME", "EMPID", "SUBCAT", "ITEMTYPE"
     ]
+    if email_col and email_col in df.columns:
+        text_cols_to_clean.append(email_col)
+
     text_cols_to_clean = [c for c in text_cols_to_clean if c in df.columns]
     df = normalize_text_columns(df, text_cols_to_clean)
 
@@ -224,6 +229,7 @@ def load_data(path_or_buffer, sheet):
         "purchase_col": purchase_col,
         "asset_id_col": asset_id_col,
         "serial_id_col": serial_id_col,
+        "email_col": email_col,  # NEW
     }
 
 # ---------- Filter utilities ----------
@@ -283,6 +289,57 @@ def read_excel_sheets(file_like_or_path) -> list[str]:
     xls = pd.ExcelFile(file_like_or_path, engine="openpyxl")
     return xls.sheet_names
 
+# ---------- Email helpers (NEW) ----------
+def _first_non_null(series: pd.Series) -> str | None:
+    if series is None:
+        return None
+    vals = pd.Series(series).dropna().astype(str).str.strip()
+    return vals.iloc[0] if not vals.empty else None
+
+def make_assets_text_table(df_user: pd.DataFrame, columns: list[str]) -> str:
+    """
+    Render a compact plain-text table for email body.
+    (Plain text is more reliable than HTML in mailto: bodies and easy to paste into Outlook.)
+    """
+    cols = [c for c in columns if c in df_user.columns]
+    if not cols:
+        return "(no details available)"
+
+    # Build rows (as strings)
+    rows = [[("" if pd.isna(v) else str(v)) for v in r] for r in df_user[cols].itertuples(index=False, name=None)]
+
+    # Compute widths, cap for readability
+    max_width = 30
+    col_widths = []
+    for idx, c in enumerate(cols):
+        content_lengths = [len(r[idx]) for r in rows] if rows else [0]
+        w = min(max([len(c)] + content_lengths), max_width)
+        col_widths.append(w)
+
+    def fmt_row(values):
+        trunc = [(v if len(v) <= w else (v[: w - 1] + "…")) for v, w in zip(values, col_widths)]
+        return " | ".join(v.ljust(w) for v, w in zip(trunc, col_widths))
+
+    header = fmt_row(cols)
+    sep = "-+-".join("-" * w for w in col_widths)
+    body = "\n".join(fmt_row(r) for r in rows)
+    return f"{header}\n{sep}\n{body}"
+
+def build_mailto_link(to_addr: str | None, subject: str, body: str) -> str:
+    """
+    Create a mailto: URL. Uses CRLF for line breaks as many clients prefer it.
+    """
+    if to_addr is None:
+        to_addr = ""
+    body = body.replace("\r\n", "\n").replace("\n", "\r\n")
+    params = []
+    if subject:
+        params.append("subject=" + urllib.parse.quote(subject, safe=""))
+    if body:
+        params.append("body=" + urllib.parse.quote(body, safe=""))
+    query = "&".join(params)
+    return f"mailto:{to_addr}?{query}" if query else f"mailto:{to_addr}"
+
 # ---------- Sidebar: Source & Load ----------
 st.sidebar.header("📄 Data Source")
 
@@ -325,6 +382,7 @@ try:
     purchase_col = data["purchase_col"]
     asset_id_col = data["asset_id_col"]
     serial_id_col = data["serial_id_col"]
+    email_col = data["email_col"]  # NEW
 except Exception as e:
     st.sidebar.error(f"Failed to load Excel: {e}")
     st.stop()
@@ -338,7 +396,7 @@ with st.sidebar.expander("Detected columns (auto)", expanded=False):
         "Purchase date column": purchase_col,
         "Asset ID column": asset_id_col,
         "Serial ID column": serial_id_col,
-        # EMPNAME/EMPID are used automatically if present
+        "Email column": email_col,  # NEW
     })
 
 # ---------- Column mapping overrides (best UX) ----------
@@ -356,6 +414,12 @@ with st.sidebar.expander("🔧 Column mapping (override auto-detect)", expanded=
         options=["(auto)"] + colnames,
         index=0,
         help="Pick the unique device identifier. Common: ASSETNO or SRNO or SERIAL."
+    )
+    email_override = st.selectbox(  # NEW
+        "Email column (optional)",
+        options=["(auto)"] + colnames,
+        index=0,
+        help="Pick the column containing the employee's email. Used for the per-user email button."
     )
 
     if user_override != "(auto)":
@@ -377,6 +441,9 @@ with st.sidebar.expander("🔧 Column mapping (override auto-detect)", expanded=
                     break
             else:
                 asset_id_col = None
+
+    if email_override != "(auto)":
+        email_col = email_override
 
 # ---------- KPIs ----------
 c1, c2, c3, c4 = st.columns(4)
@@ -473,7 +540,7 @@ if action == "All assets":
 
 elif action == "All users → all assets (grouped)":
     with tab_table:
-        st.subheader("All users → all assets (grouped)")
+        st.subheader("All users → all assets (grouped, only users with ≥2 assets)")
         # Validate required columns
         if not user_col or user_col not in filtered.columns:
             st.warning("User column not detected. Use the 'Column mapping' override to select EMPNAME/USER/etc.")
@@ -490,9 +557,8 @@ elif action == "All users → all assets (grouped)":
                 .sort_values(["ASSET_COUNT", user_col], ascending=[False, True])
             )
 
-            # Toggle to show only multi-asset users
-            multi_only_group = st.checkbox("Only users with multiple assets (≥2)", value=False, key="group_multi_only")
-            view_summary = summary.query("ASSET_COUNT >= 2") if multi_only_group else summary
+            # ONLY users with multiple assets (≥2)
+            view_summary = summary.query("ASSET_COUNT >= 2").copy()
 
             st.write("Summary (user → asset count)")
             st.dataframe(view_summary, use_container_width=True, height=300)
@@ -500,19 +566,77 @@ elif action == "All users → all assets (grouped)":
             # Pre-sort once for reuse
             df_sorted = filtered.sort_values([user_col, asset_id_col], na_position="last")
 
-            st.markdown("#### Details by user")
-            for _, row in view_summary.iterrows():
+            # -------- Details by user (ONLY ≥2 assets) --------
+            st.markdown("#### Details by user (≥2 assets)")
+            email_table_pref_cols = [
+                asset_id_col, serial_id_col, "MAKE", "MODEL", "SUBCAT", "STATUS", "CITY", "COUNTRY", "LOCNAME"
+            ]
+            email_table_pref_cols = [c for c in email_table_pref_cols if c]  # drop None
+
+            for i, (_, row) in enumerate(view_summary.iterrows()):
                 u = row[user_col]
                 label = u if pd.notna(u) else "(missing user)"
                 user_assets = df_sorted[df_sorted[user_col] == u]
+
                 with st.expander(f"{label} — {len(user_assets)} asset(s)"):
                     # Show preferred columns if available
                     cols_to_show = [c for c in PREFERRED_DISPLAY_COLUMNS if c in user_assets.columns] or list(user_assets.columns)
                     st.dataframe(user_assets[cols_to_show], use_container_width=True, height=300)
 
-            # Set result to a flat table so export works for the chosen scope
-            result = df_sorted if not multi_only_group else df_sorted[df_sorted[user_col].isin(view_summary[user_col])]
+                    # -------- Email generation UI (per user, copy-ready for Outlook) --------
+                    st.markdown("**✉️ Generate ready-to-send email**")
 
+                    # Recipient (from email column if present)
+                    recipient = None
+                    if email_col and (email_col in user_assets.columns):
+                        recipient = _first_non_null(user_assets[email_col])
+
+                    # Subject + Body defaults (editable)
+                    default_subject = "Asset review — items assigned to you"
+                    default_greeting = f"Hi {label},"
+                    body_table = make_assets_text_table(user_assets, email_table_pref_cols or cols_to_show)
+                    default_body = (
+                        f"{default_greeting}\n\n"
+                        "Please return any assets that you are not using from the following assets under your name:\n\n"
+                        f"{body_table}\n\n"
+                        "If any device is in active use, no action is needed.\n"
+                        "Otherwise, please return unused items to IT. Thank you!\n\n"
+                        "— IT Asset Management"
+                    )
+
+                    subject_val = st.text_input(
+                        "Email subject",
+                        value=default_subject,
+                        key=f"subject_group_{i}"
+                    )
+                    body_val = st.text_area(
+                        "Email body (editable; plain text works best in Outlook copy/paste)",
+                        value=default_body,
+                        height=220,
+                        key=f"body_group_{i}"
+                    )
+
+                    # Convenience: mailto link (optional)
+                    mailto_url = build_mailto_link(recipient, subject_val, body_val)
+
+                    cols_email = st.columns([1, 2])
+                    with cols_email[0]:
+                        st.link_button("Open in Mail", mailto_url, use_container_width=True)
+                    with cols_email[1]:
+                        if recipient:
+                            st.caption(f"To: {recipient}")
+                        else:
+                            st.info(
+                                "No email found for this person. Map the Email column in **Column mapping** or enter the address manually after clicking **Open in Mail**."
+                            )
+
+                    # Copy-ready preview (includes Subject + Body) — easy to paste into Outlook
+                    preview_text = f"To: {recipient or '<add recipient>'}\nSubject: {subject_val}\n\n{body_val}"
+                    st.markdown("**Copy-ready preview (click the copy icon):**")
+                    st.code(preview_text, language="text")
+
+            # Set result to a flat table so export works for this scope (only multi-asset users)
+            result = df_sorted[df_sorted[user_col].isin(view_summary[user_col])]
 
 elif action == "Users with multiple assets":
     # ---------- HEADER (inside the Table tab) ----------
@@ -546,20 +670,17 @@ elif action == "Users with multiple assets":
         if sort_cols:
             result = result.sort_values(sort_cols, na_position="last", kind="mergesort").reset_index(drop=True)
 
-        # ---------- SHOW CAPTION + DEDICATED DOWNLOAD BUTTON (ABOVE THE MAIN "Results" AREA) ----------
+        # ---------- SHOW CAPTION + DEDICATED DOWNLOAD BUTTON ----------
         with tab_table:
             st.caption(f"Users with ≥2 assets: {multi_users.nunique()} • Rows shown: {len(result):,}")
 
-            # Build export bytes regardless of row count; still produces a valid (possibly empty) Excel sheet
             cols_to_export = [c for c in PREFERRED_DISPLAY_COLUMNS if c in result.columns] or list(result.columns)
             try:
                 xbytes_multi = export_df_to_excel_bytes(result[cols_to_export])
             except Exception as ex:
-                # If openpyxl is missing or any other export error occurs, surface it clearly
                 st.error(f"Export failed: {ex}")
                 xbytes_multi = None
 
-            # Put the button right here so it's visible on THIS section
             if xbytes_multi is not None:
                 timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
                 export_name = f"assets_users_with_multiple_assets_{timestamp}.xlsx"
@@ -568,7 +689,7 @@ elif action == "Users with multiple assets":
                     data=xbytes_multi,
                     file_name=export_name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_multi_assets_excel_top",  # unique key ⇒ never collides
+                    key="download_multi_assets_excel_top",
                     use_container_width=True
                 )
 
