@@ -8,22 +8,19 @@
 # Filters and explores all assets; asset type filter driven by SUBCAT column.
 # -----------------------------
 import io
+import os
+import base64
 import numpy as np
 import pandas as pd
 import streamlit as st
 import datetime as dt
 import altair as alt
-import base64
 from pathlib import Path
 
 # Page setup
 st.set_page_config(page_title="Asset Dashboard", layout="wide")
+
 # --- Clean, perfectly aligned logo + title header ---
-# --- Clean, perfectly aligned logo + title header (fixed) ---
-from pathlib import Path
-
-import os
-
 def resolve_logo(filename: str) -> Path | None:
     """Look for the file next to app.py and in ./assets or ./static."""
     here = Path(__file__).parent.resolve()
@@ -50,7 +47,7 @@ def to_b64(path: Path | None) -> str | None:
 
 # Theme & logo pick (theme.base is "dark" or "light")
 _theme = st.get_option("theme.base")
-is_dark = (_theme == "dark")  # <-- fix: lowercase "dark"
+is_dark = (_theme == "dark")  # lowercase "dark"
 
 LIGHT_LOGO = resolve_logo("assetslogo_light.png")
 DARK_LOGO  = resolve_logo("assetslogo_dark.png")
@@ -79,23 +76,19 @@ st.markdown("""
   width: auto;
   flex: 0 0 auto;
   object-fit: contain;
-  transform: translateY(2px);        /* tiny nudge so it aligns optically with the text baseline */
+  transform: translateY(2px);        /* tiny nudge to align with text baseline */
 }
 
 /* Title reset so it doesn't push down */
 .app-title {
   margin: 0;
   line-height: 1.1;
-  font-weight: 700;                  /* keep Streamlit's bold look */
+  font-weight: 700;
 }
 
 /* Optional: responsive scaling of the title on larger screens */
-@media (min-width: 900px) {
-  .app-title { font-size: 2.0rem; }
-}
-@media (min-width: 1200px) {
-  .app-title { font-size: 2.2rem; }
-}
+@media (min-width: 900px)  { .app-title { font-size: 2.0rem; } }
+@media (min-width: 1200px) { .app-title { font-size: 2.2rem; } }
 </style>
 """, unsafe_allow_html=True)
 
@@ -121,8 +114,6 @@ else:
         unsafe_allow_html=True
     )
 
-
-
 # Defaults (can be overridden in the sidebar)
 DEFAULT_EXCEL_PATH = "assetlist.xlsx"
 DEFAULT_SHEET_NAME = "Sheet1"
@@ -144,7 +135,6 @@ PREFERRED_DISPLAY_COLUMNS = [
 ]
 
 # ---------- Helpers: normalization and detection ----------
-
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Upper-case headers, collapse spaces to underscores, trim whitespace."""
     df.columns = (
@@ -186,7 +176,6 @@ def compute_age_from_purchase_date(df: pd.DataFrame, purchase_col: str, out_col:
     return df
 
 # ---------- Data load (cached) ----------
-
 @st.cache_data(show_spinner=True)
 def load_data(path_or_buffer, sheet):
     """
@@ -237,8 +226,7 @@ def load_data(path_or_buffer, sheet):
         "serial_id_col": serial_id_col,
     }
 
-# ---------- Filter utilities (optimized) ----------
-
+# ---------- Filter utilities ----------
 def options_for(df: pd.DataFrame, col: str) -> list[str]:
     if col not in df.columns:
         return []
@@ -296,7 +284,6 @@ def read_excel_sheets(file_like_or_path) -> list[str]:
     return xls.sheet_names
 
 # ---------- Sidebar: Source & Load ----------
-
 st.sidebar.header("📄 Data Source")
 
 # 1) File uploader (recommended for internal users)
@@ -355,12 +342,11 @@ with st.sidebar.expander("Detected columns (auto)", expanded=False):
     })
 
 # ---------- Column mapping overrides (best UX) ----------
-
 with st.sidebar.expander("🔧 Column mapping (override auto-detect)", expanded=False):
     colnames = list(df.columns)
 
     user_override = st.selectbox(
-        "User column (for 'Users with multiple assets')",
+        "User column (for 'Users with multiple assets' & grouped view)",
         options=["(auto)"] + colnames,
         index=0,
         help="Pick the column representing the person. Common: EMPNAME or USER."
@@ -393,7 +379,6 @@ with st.sidebar.expander("🔧 Column mapping (override auto-detect)", expanded=
                 asset_id_col = None
 
 # ---------- KPIs ----------
-
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Total assets", f"{len(df):,}")
@@ -411,16 +396,16 @@ with c4:
 tab_table, tab_charts, tab_summary = st.tabs(["📋 Table", "📊 Charts", "ℹ️ Summary"])
 
 # ---------- Sidebar: Filters & Actions ----------
-
 st.sidebar.header("🎛️ Filters & Actions")
 
 # 🔝 Asset type filter (SUBCAT) first
 subcat_options = options_for(df, "SUBCAT")
 subcat_sel = st.sidebar.multiselect("SUBCAT (Asset type)", subcat_options, help="Select one or more asset types.")
 
+# NEW: add grouped view into the action list
 action = st.sidebar.radio(
     "Choose action",
-    ["All assets", "Users with multiple assets", "Assets aged ≥ N years"],
+    ["All assets", "All users → all assets (grouped)", "Users with multiple assets", "Assets aged ≥ N years"],
     index=0
 )
 
@@ -463,8 +448,7 @@ search_cols = st.sidebar.multiselect(
 query = st.sidebar.text_input("Keyword search", placeholder="Type a keyword (e.g., model, user, city...)")
 ascending = st.sidebar.checkbox("Ascending", value=True)
 
-# ---------- Apply filters & search (correct ITEMTYPE wiring) ----------
-
+# ---------- Apply filters & search ----------
 filtered = df
 filtered = apply_list_filter(filtered, "SUBCAT",   subcat_sel)
 filtered = apply_list_filter(filtered, "ITEMTYPE", itemtype_sel)
@@ -482,28 +466,111 @@ filtered = keyword_search(filtered, query, search_cols)
 st.caption(f"Filtered rows (ALL assets): {len(filtered):,} / {len(df):,}")
 
 # ---------- Main actions ----------
-
 if action == "All assets":
     with tab_table:
         st.subheader("All Assets (after filters & search)")
     result = filtered
 
-elif action == "Users with multiple assets":
+elif action == "All users → all assets (grouped)":
     with tab_table:
-        st.subheader("Users with Multiple Assets")
-    summary = users_with_multiple_assets(filtered, user_col, asset_id_col)
-    with tab_table:
-        st.write(f"Found {len(summary)} user(s) with > 1 asset.")
-        st.dataframe(summary, use_container_width=True, height=350)
-        if user_col and user_col in filtered.columns and len(summary):
-            chosen = st.selectbox("Drill down to user", options=["(none)"] + summary[user_col].astype(str).tolist())
-            result = filtered[filtered[user_col].astype(str) == chosen] if chosen and chosen != "(none)" else filtered.head(0)
-        else:
-            if not user_col:
-                st.warning("User column not detected. Use the 'Column mapping' override to select EMPNAME or USER.")
-            if not asset_id_col:
-                st.warning("Asset ID column not detected. Use the 'Column mapping' override to select ASSETNO/SRNO/SERIAL.")
+        st.subheader("All users → all assets (grouped)")
+        # Validate required columns
+        if not user_col or user_col not in filtered.columns:
+            st.warning("User column not detected. Use the 'Column mapping' override to select EMPNAME/USER/etc.")
             result = filtered.head(0)
+        elif not asset_id_col or asset_id_col not in filtered.columns:
+            st.warning("Asset ID column not detected. Use the 'Column mapping' override to select ASSETNO/SRNO/SERIAL.")
+            result = filtered.head(0)
+        else:
+            # Summary (user → unique asset count)
+            summary = (
+                filtered.groupby(user_col, dropna=False)[asset_id_col]
+                .nunique()
+                .reset_index(name="ASSET_COUNT")
+                .sort_values(["ASSET_COUNT", user_col], ascending=[False, True])
+            )
+
+            # Toggle to show only multi-asset users
+            multi_only_group = st.checkbox("Only users with multiple assets (≥2)", value=False, key="group_multi_only")
+            view_summary = summary.query("ASSET_COUNT >= 2") if multi_only_group else summary
+
+            st.write("Summary (user → asset count)")
+            st.dataframe(view_summary, use_container_width=True, height=300)
+
+            # Pre-sort once for reuse
+            df_sorted = filtered.sort_values([user_col, asset_id_col], na_position="last")
+
+            st.markdown("#### Details by user")
+            for _, row in view_summary.iterrows():
+                u = row[user_col]
+                label = u if pd.notna(u) else "(missing user)"
+                user_assets = df_sorted[df_sorted[user_col] == u]
+                with st.expander(f"{label} — {len(user_assets)} asset(s)"):
+                    # Show preferred columns if available
+                    cols_to_show = [c for c in PREFERRED_DISPLAY_COLUMNS if c in user_assets.columns] or list(user_assets.columns)
+                    st.dataframe(user_assets[cols_to_show], use_container_width=True, height=300)
+
+            # Set result to a flat table so export works for the chosen scope
+            result = df_sorted if not multi_only_group else df_sorted[df_sorted[user_col].isin(view_summary[user_col])]
+
+
+elif action == "Users with multiple assets":
+    # ---------- HEADER (inside the Table tab) ----------
+    with tab_table:
+        st.subheader("All assets for users who own ≥ 2 assets (flat table)")
+
+    # ---------- VALIDATION ----------
+    if not user_col or user_col not in filtered.columns:
+        with tab_table:
+            st.warning("User column not detected. Use the 'Column mapping' override to select EMPNAME/USER/etc.")
+        result = filtered.head(0)
+
+    elif not asset_id_col or asset_id_col not in filtered.columns:
+        with tab_table:
+            st.warning("Asset ID column not detected. Use the 'Column mapping' override to select ASSETNO/SRNO/SERIAL.")
+        result = filtered.head(0)
+
+    else:
+        # ---------- COMPUTE THE FLAT TABLE (ALL ROWS FOR USERS WITH ≥2 ASSETS) ----------
+        counts = (
+            filtered.groupby(user_col, dropna=False)[asset_id_col]
+            .nunique()
+            .reset_index(name="ASSET_COUNT")
+        )
+        multi_users = counts.loc[counts["ASSET_COUNT"] >= 2, user_col].dropna()
+
+        result = filtered[filtered[user_col].isin(multi_users)].copy()
+
+        # Stable, readable ordering
+        sort_cols = [c for c in [user_col, asset_id_col] if c in result.columns]
+        if sort_cols:
+            result = result.sort_values(sort_cols, na_position="last", kind="mergesort").reset_index(drop=True)
+
+        # ---------- SHOW CAPTION + DEDICATED DOWNLOAD BUTTON (ABOVE THE MAIN "Results" AREA) ----------
+        with tab_table:
+            st.caption(f"Users with ≥2 assets: {multi_users.nunique()} • Rows shown: {len(result):,}")
+
+            # Build export bytes regardless of row count; still produces a valid (possibly empty) Excel sheet
+            cols_to_export = [c for c in PREFERRED_DISPLAY_COLUMNS if c in result.columns] or list(result.columns)
+            try:
+                xbytes_multi = export_df_to_excel_bytes(result[cols_to_export])
+            except Exception as ex:
+                # If openpyxl is missing or any other export error occurs, surface it clearly
+                st.error(f"Export failed: {ex}")
+                xbytes_multi = None
+
+            # Put the button right here so it's visible on THIS section
+            if xbytes_multi is not None:
+                timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
+                export_name = f"assets_users_with_multiple_assets_{timestamp}.xlsx"
+                st.download_button(
+                    label="⬇️ Download as spreadsheet (Excel)",
+                    data=xbytes_multi,
+                    file_name=export_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_multi_assets_excel_top",  # unique key ⇒ never collides
+                    use_container_width=True
+                )
 
 elif action == "Assets aged ≥ N years":
     threshold = st.sidebar.number_input(
@@ -521,22 +588,17 @@ elif action == "Assets aged ≥ N years":
 else:
     result = filtered
 
-# Optional sorting hook (UI not wired)
-# result = apply_sort(result, sort_col, ascending)
-
 # ---------- TABLE TAB: display & export ----------
-
 with tab_table:
     cols_to_show = [c for c in PREFERRED_DISPLAY_COLUMNS if c in result.columns] or list(result.columns)
 
     st.markdown("### Results")
     st.write(f"Rows: {len(result):,}")
-    # Show ALL rows (no cap)
     st.dataframe(result[cols_to_show], use_container_width=True, height=560)
 
     # Timestamped export filename
     timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M")
-    safe_action = action.replace(" ", "_").replace("≥", "ge")
+    safe_action = action.replace(" ", "_").replace("≥", "ge").replace("→", "to")
     export_name = f"assets_{safe_action}_{timestamp}.xlsx"
 
     if len(result):
@@ -549,7 +611,6 @@ with tab_table:
         )
 
 # ---------- CHARTS TAB ----------
-
 with tab_charts:
     st.subheader("Key Visuals")
 
@@ -607,7 +668,6 @@ with tab_charts:
             st.altair_chart(chart, use_container_width=True)
 
 # ---------- SUMMARY TAB ----------
-
 with tab_summary:
     st.subheader("Data Quality & Summary")
 
