@@ -1,5 +1,5 @@
-# KPIT-Asset-Dashboard
-This app is used to determine certain values, filter out assets, and predict when an asset should be replaced within a company. Originally used by KPIT's IT team. :)
+# Asset-Dashboard
+This app is used to determine certain values, filter out assets, and predict when an asset should be replaced within a company.
 
 # IT Streamlit App
 
