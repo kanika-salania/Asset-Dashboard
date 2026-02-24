@@ -132,7 +132,6 @@ else:
     )
 
 # Defaults (can be overridden in the sidebar)
-DEFAULT_EXCEL_PATH = "assetlist.xlsx"
 DEFAULT_SHEET_NAME = "Sheet1"
 
 # Auto-detection candidates
@@ -614,40 +613,46 @@ def train_bootstrap_model(df_feats: pd.DataFrame, cat_cols: list[str], num_cols:
     best_name = max(scores, key=lambda k: (scores[k]["ap"], scores[k]["auc"]))
     return best_name, scores[best_name]["model"], scores
 
-# ---------- Sidebar: Source & Load ----------
-# ---------- Sidebar: Source & Load ----------
+# ---------- Sidebar: Source & Load (REPLACED, SINGLE SOURCE OF TRUTH) ----------
 st.sidebar.header("📄 Data Source")
-
-uploaded = st.sidebar.file_uploader(
-    "Upload an Excel file (.xlsx)",
-    type=["xlsx"],
-    help="Pick an Excel file from your computer. Upload overrides the path."
-)
-
-excel_path = st.sidebar.text_input("Or provide Excel file path", value=DEFAULT_EXCEL_PATH)
 
 import hashlib
 import io
 import os
 
+def _on_upload_change():
+    # Clear all cached data whenever a new file is selected
+    st.cache_data.clear()
+    # Also clear any derived state (e.g., trained model) that depends on the data
+    for k in ["_asset_model"]:
+        st.session_state.pop(k, None)
 
-# --------- Read sheets safely ----------
-def get_sheet_names_from_bytes(file_bytes):
+uploaded = st.sidebar.file_uploader(
+    "Upload an Excel file (.xlsx)",
+    type=["xlsx"],
+    help="Upload overrides the path input",
+    key="asset_file",
+    on_change=_on_upload_change,
+)
+
+excel_path = st.sidebar.text_input("Or provide Excel file path", value=DEFAULT_EXCEL_PATH)
+
+# ---- Helpers that ONLY work from bytes ----
+def read_excel_sheets_from_bytes(file_bytes) -> list[str]:
     return pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl").sheet_names
 
-
-# --------- Cache-aware loader (fixed) ----------
 @st.cache_data(show_spinner=True)
-def load_data_fixed(file_bytes, sheet):
+def load_data_fixed(file_bytes: bytes, sheet_name: str):
     """
-    Fully safe loader:
-    - Always reads from clean BytesIO
-    - Cached by file bytes + sheet
+    Single, canonical loader for the whole app.
+    - Always read from a fresh BytesIO
+    - Streamlit cache is keyed on (file_bytes, sheet_name) automatically
+    - Performs all your normalization and detection
     """
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, engine="openpyxl")
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, engine="openpyxl")
     df = normalize_columns(df)
 
-    # --- your existing detection / cleanup code ---
+    # Auto-detect key columns
     user_col = guess_column(df, USER_CANDIDATES)
     age_col = guess_column(df, AGE_CANDIDATES)
     purchase_col = guess_column(df, PURCHASE_DATE_CANDIDATES)
@@ -655,31 +660,35 @@ def load_data_fixed(file_bytes, sheet):
     serial_id_col = guess_column(df, SERIAL_ID_CANDIDATES)
     email_col = guess_column(df, EMAIL_CANDIDATES)
 
+    # Fallback for user_col to EMPNAME/EMPID if no user-like column detected
     if user_col is None:
         if "EMPNAME" in df.columns:
             user_col = "EMPNAME"
         elif "EMPID" in df.columns:
             user_col = "EMPID"
 
+    # Compute AGE from purchase date if needed
     if age_col is None and purchase_col is not None:
         df = compute_age_from_purchase_date(df, purchase_col, out_col="AGE")
         age_col = "AGE"
 
+    # Ensure numeric AGE if present
     if age_col and age_col in df.columns:
         df[age_col] = to_numeric_safe(df[age_col])
 
+    # Clean text columns (keep case for names/emails)
     text_cols_to_clean = [
-        "MAKE","MODEL","CITY","COUNTRY","SUBLOC","LEVEL",
-        "LOCNAME","SEATNO","STATUS","USER","ASSIGNEE","ASSIGNED_TO",
-        "OWNER","CAT","EMPNAME","EMPID","SUBCAT","ITEMTYPE"
+        "MAKE","MODEL","CITY","COUNTRY","SUBLOC","LEVEL","LOCNAME","SEATNO","STATUS",
+        "USER","ASSIGNEE","ASSIGNED_TO","OWNER","CAT","EMPNAME","EMPID","SUBCAT","ITEMTYPE"
     ]
     if email_col and email_col in df.columns:
         text_cols_to_clean.append(email_col)
+    text_cols_to_clean = [c for c in text_cols_to_clean if c in df.columns]
+    df = normalize_text_columns(df, text_cols_to_clean)
 
-    df = normalize_text_columns(df, [c for c in text_cols_to_clean if c in df.columns])
-
-    cat_cols = ["MAKE","MODEL","SUBCAT","ITEMTYPE","CITY","COUNTRY","STATUS","LOCNAME","SUBLOC","LEVEL","CAT"]
-    df = standardize_value_case(df, [c for c in cat_cols if c in df.columns])
+    # Standardize values on key categoricals (upper)
+    categorical_value_cols = ["MAKE","MODEL","SUBCAT","ITEMTYPE","CITY","COUNTRY","STATUS","LOCNAME","SUBLOC","LEVEL","CAT"]
+    df = standardize_value_case(df, [c for c in categorical_value_cols if c in df.columns], mode="upper")
 
     return {
         "df": df,
@@ -691,36 +700,33 @@ def load_data_fixed(file_bytes, sheet):
         "email_col": email_col,
     }
 
-
-# ---------- Determine source & load sheet names ----------
+# ---- Read sheet names (bytes-first), then load
 file_bytes = None
+file_label = None
 sheet_names = []
 
-if uploaded is not None:
-    file_bytes = uploaded.getvalue()
-    try:
-        sheet_names = get_sheet_names_from_bytes(file_bytes)
-    except Exception as e:
-        st.sidebar.error(f"Failed reading uploaded file: {e}")
-else:
-    if os.path.exists(excel_path):
-        try:
-            with open(excel_path, "rb") as f:
-                file_bytes = f.read()
-            sheet_names = get_sheet_names_from_bytes(file_bytes)
-        except Exception as e:
-            st.sidebar.error(f"Failed reading file path: {e}")
+try:
+    if uploaded is not None:
+        file_bytes = uploaded.getvalue()
+        file_label = uploaded.name
+        sheet_names = read_excel_sheets_from_bytes(file_bytes)
+    elif os.path.exists(excel_path):
+        with open(excel_path, "rb") as f:
+            file_bytes = f.read()
+        file_label = os.path.basename(excel_path)
+        sheet_names = read_excel_sheets_from_bytes(file_bytes)
     else:
-        st.sidebar.warning("Provide a valid file path or upload a file.")
+        st.sidebar.info("Upload a file or provide a valid path to continue.")
+except Exception as e:
+    st.sidebar.error(f"Failed to read Excel metadata: {e}")
 
-# Sheet selection
+# Sheet select
 if sheet_names:
-    sheet = st.sidebar.selectbox("Sheet", sheet_names, index=0)
+    sheet = st.sidebar.selectbox("Sheet", options=sheet_names, index=0)
 else:
-    sheet = st.sidebar.text_input("Sheet (name/index)", "Sheet1")
+    sheet = st.sidebar.text_input("Sheet (name or index)", value=str(DEFAULT_SHEET_NAME))
 
-
-# ---------- Final load ----------
+# Final load
 if file_bytes is not None:
     try:
         data = load_data_fixed(file_bytes, sheet)
@@ -731,12 +737,23 @@ if file_bytes is not None:
         asset_id_col = data["asset_id_col"]
         serial_id_col = data["serial_id_col"]
         email_col = data["email_col"]
+
+        # Debug badge + success message
+        md5 = hashlib.md5(file_bytes).hexdigest()[:8]
         st.sidebar.success(f"Loaded {len(df):,} rows")
+        with st.sidebar.expander("Dataset info", expanded=False):
+            st.write({
+                "file": file_label or "(bytes)",
+                "sheet": sheet,
+                "md5": md5,
+                "rows": int(len(df)),
+                "cols": list(df.columns)[:12] + (["…"] if len(df.columns) > 12 else []),
+            })
     except Exception as e:
-        st.sidebar.error(f"Data load error: {e}")
+        st.sidebar.error(f"Failed to load Excel: {e}")
         st.stop()
 else:
-    st.stop()
+    st.stop()  # Stop the app until a valid dataset is loaded
 
 st.sidebar.success(f"Loaded {len(df):,} rows")
 
@@ -1274,4 +1291,3 @@ with tab_ml:
             ] if c in combined.columns] or list(combined.columns)
             st.dataframe(combined.sort_values(["IMMEDIATE_REPLACE","_ML_PROB"], ascending=[False,False])[cols_to_show],
                          use_container_width=True, height=300)
-
