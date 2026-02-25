@@ -1,5 +1,5 @@
 # -----------------------------
-# Asset Dashboard (Streamlit) — All Assets  (UPDATED WITH POLICY + ML + NORMALIZED VALUES)
+# Asset Dashboard (Streamlit) — All Assets
 # -----------------------------
 # HOW TO RUN:
 #   streamlit run app.py
@@ -29,7 +29,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
-import joblib
+import hashlib
 
 # Page setup
 st.set_page_config(page_title="Asset Dashboard", layout="wide")
@@ -71,9 +71,8 @@ def card():
         st.markdown('</div>', unsafe_allow_html=True)
     return _card()
 
-# --- Clean, perfectly aligned logo + title header ---
+# --- Logo + title header ---
 def resolve_logo(filename: str) -> Optional[Path]:
-    """Look for the file next to app.py and in ./assets or ./static."""
     here = Path(__file__).parent.resolve()
     cwd = Path.cwd().resolve()
     for p in [
@@ -96,13 +95,10 @@ def to_b64(path: Optional[Path]) -> Optional[str]:
     except Exception:
         return None
 
-# Theme & logo pick (theme.base is "dark" or "light")
 _theme = st.get_option("theme.base")
 is_dark = (_theme == "dark")
-
 LIGHT_LOGO = resolve_logo("assetslogo_light.png")
 DARK_LOGO  = resolve_logo("assetslogo_dark.png")
-
 logo_path = DARK_LOGO if (is_dark and DARK_LOGO) else LIGHT_LOGO
 logo_src  = None
 if logo_path:
@@ -110,7 +106,6 @@ if logo_path:
     if b64:
         logo_src = f"data:image/png;base64,{b64}"
 
-# Render header row
 if logo_src:
     st.markdown(
         f"""
@@ -131,29 +126,28 @@ else:
         unsafe_allow_html=True
     )
 
-# Defaults (can be overridden in the sidebar)
+# Defaults
+DEFAULT_EXCEL_PATH = "assetlist.xlsx"
 DEFAULT_SHEET_NAME = "Sheet1"
 
 # Auto-detection candidates
-USER_CANDIDATES = ["USER", "ASSIGNEE", "ASSIGNED_TO", "OWNER", "USERNAME", "EMPLOYEE", "EMAIL", "EMPNAME", "EMPID"]
-AGE_CANDIDATES = ["AGE", "ASSET_AGE_YEARS"]
-PURCHASE_DATE_CANDIDATES = ["PURCHASE_DATE", "BUY_DATE", "PO_DATE", "INVOICE_DATE", "PROCUREMENT_DATE", "PURDATE"]
-ASSET_ID_CANDIDATES = ["ASSETNO", "ASSET_NO", "ASSET_NUMBER", "ASSET_ID"]
-SERIAL_ID_CANDIDATES = ["SRNO", "SERIAL", "SERIAL_NO", "SERIALNUMBER"]
-EMAIL_CANDIDATES = ["EMAIL", "MAIL", "USER_EMAIL", "WORK_EMAIL", "E_MAIL"]
+USER_CANDIDATES = ["USER","ASSIGNEE","ASSIGNED_TO","OWNER","USERNAME","EMPLOYEE","EMAIL","EMPNAME","EMPID"]
+AGE_CANDIDATES = ["AGE","ASSET_AGE_YEARS"]
+PURCHASE_DATE_CANDIDATES = ["PURCHASE_DATE","BUY_DATE","PO_DATE","INVOICE_DATE","PROCUREMENT_DATE","PURDATE"]
+ASSET_ID_CANDIDATES = ["ASSETNO","ASSET_NO","ASSET_NUMBER","ASSET_ID"]
+SERIAL_ID_CANDIDATES = ["SRNO","SERIAL","SERIAL_NO","SERIALNUMBER"]
+EMAIL_CANDIDATES = ["EMAIL","MAIL","USER_EMAIL","WORK_EMAIL","E_MAIL"]
 
-# Preferred Results table order (includes EMPNAME & EMPID)
 PREFERRED_DISPLAY_COLUMNS = [
-    "ASSETNO", "SRNO", "MAKE", "MODEL",
-    "EMPNAME", "EMPID",
+    "ASSETNO","SRNO","MAKE","MODEL",
+    "EMPNAME","EMPID",
     "SUBCAT",
-    "CITY", "COUNTRY",
-    "SUBLOC", "LEVEL", "SEATNO", "LOCNAME", "STATUS", "AGE", "USER", "ITEMTYPE"
+    "CITY","COUNTRY",
+    "SUBLOC","LEVEL","SEATNO","LOCNAME","STATUS","AGE","USER","ITEMTYPE"
 ]
 
 # ---------- Helpers: normalization and detection ----------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Upper-case headers, collapse spaces to underscores, trim whitespace."""
     df.columns = (
         df.columns.astype(str)
         .str.strip()
@@ -163,9 +157,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def normalize_text_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
-    """
-    Clean text-like columns for reliable filtering/search (preserve NaN).
-    """
     for col in columns:
         if col in df.columns:
             s = df[col].astype(str).str.strip()
@@ -173,16 +164,10 @@ def normalize_text_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame
             df[col] = s
     return df
 
-# ==== NEW: standardize value casing in key categorical columns ====
 def standardize_value_case(df: pd.DataFrame, columns: list[str], mode: str = "upper") -> pd.DataFrame:
-    """
-    Force consistent casing for category values so 'self' == 'SELF'.
-    Only applied to selected categorical columns (not names/emails).
-    """
     for col in columns:
         if col in df.columns:
             s = df[col]
-            # avoid uppercasing pure NaNs
             mask = s.notna()
             if mode == "upper":
                 df.loc[mask, col] = s[mask].astype(str).str.strip().str.upper()
@@ -210,68 +195,6 @@ def compute_age_from_purchase_date(df: pd.DataFrame, purchase_col: str, out_col:
     df[out_col] = np.floor(age_years).astype("Int64")
     return df
 
-# ---------- Data load (cached) ----------
-@st.cache_data(show_spinner=True)
-def load_data(path_or_buffer, sheet):
-    """
-    Load Excel from a path or uploaded file-like object.
-    Normalize headers, detect columns, compute age if possible, and clean/standardize text.
-    """
-    df = pd.read_excel(path_or_buffer, sheet_name=sheet, engine="openpyxl")
-    df = normalize_columns(df)
-
-    # Auto-detect key columns
-    user_col = guess_column(df, USER_CANDIDATES)
-    age_col = guess_column(df, AGE_CANDIDATES)
-    purchase_col = guess_column(df, PURCHASE_DATE_CANDIDATES)
-    asset_id_col = guess_column(df, ASSET_ID_CANDIDATES)
-    serial_id_col = guess_column(df, SERIAL_ID_CANDIDATES)
-    email_col = guess_column(df, EMAIL_CANDIDATES)
-
-    # Fallback for user_col to EMPNAME/EMPID if no user-like column detected
-    if user_col is None:
-        if "EMPNAME" in df.columns:
-            user_col = "EMPNAME"
-        elif "EMPID" in df.columns:
-            user_col = "EMPID"
-
-    # Compute AGE from purchase date if needed
-    if age_col is None and purchase_col is not None:
-        df = compute_age_from_purchase_date(df, purchase_col, out_col="AGE")
-        age_col = "AGE"
-
-    # Ensure numeric AGE if present
-    if age_col and age_col in df.columns:
-        df[age_col] = to_numeric_safe(df[age_col])
-
-    # Clean text columns (keep case for names/emails)
-    text_cols_to_clean = [
-        "MAKE", "MODEL", "CITY", "COUNTRY", "SUBLOC", "LEVEL",
-        "LOCNAME", "SEATNO", "STATUS", "USER", "ASSIGNEE", "ASSIGNED_TO", "OWNER", "CAT",
-        "EMPNAME", "EMPID", "SUBCAT", "ITEMTYPE"
-    ]
-    if email_col and email_col in df.columns:
-        text_cols_to_clean.append(email_col)
-
-    text_cols_to_clean = [c for c in text_cols_to_clean if c in df.columns]
-    df = normalize_text_columns(df, text_cols_to_clean)
-
-    # ==== UPDATED: standardize values on key categoricals (uppercased values) ====
-    categorical_value_cols = [
-        "MAKE","MODEL","SUBCAT","ITEMTYPE","CITY","COUNTRY","STATUS","LOCNAME","SUBLOC","LEVEL","CAT"
-    ]
-    df = standardize_value_case(df, [c for c in categorical_value_cols if c in df.columns], mode="upper")
-
-    return {
-        "df": df,
-        "user_col": user_col,
-        "age_col": age_col,
-        "purchase_col": purchase_col,
-        "asset_id_col": asset_id_col,
-        "serial_id_col": serial_id_col,
-        "email_col": email_col,
-    }
-
 # ---------- Filter utilities ----------
 def options_for(df: pd.DataFrame, col: str) -> list[str]:
     if col not in df.columns:
@@ -289,6 +212,11 @@ def apply_list_filter(df_in: pd.DataFrame, col: str, selected: list) -> pd.DataF
     return df_in[series.isin(right)]
 
 def keyword_search(df_in: pd.DataFrame, query: str, cols: list[str]) -> pd.DataFrame:
+    """
+    NaN-safe keyword search across selected columns.
+    - Replaces NaN with empty string before searching
+    - Avoids accidental matches on the literal string "nan"
+    """
     if not query or not str(query).strip():
         return df_in
     q = str(query).strip()
@@ -298,6 +226,8 @@ def keyword_search(df_in: pd.DataFrame, query: str, cols: list[str]) -> pd.DataF
         series = df_in[c]
         if not (pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series)):
             series = series.astype(str)
+        series = series.where(series.notna(), "").astype(str).str.strip()
+        series = series.replace("nan", "", regex=False)
         col_mask = series.str.contains(q, case=False, na=False)
         mask = col_mask if mask is None else (mask | col_mask)
     return df_in[mask] if mask is not None else df_in
@@ -322,10 +252,6 @@ def export_df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False)
     return output.getvalue()
-
-def read_excel_sheets(file_like_or_path) -> list[str]:
-    xls = pd.ExcelFile(file_like_or_path, engine="openpyxl")
-    return xls.sheet_names
 
 # ---------- Email helpers ----------
 def _first_non_null(series: pd.Series) -> Optional[str]:
@@ -362,7 +288,7 @@ def make_html_table(df_user: pd.DataFrame, columns: list[str]) -> str:
     cols = [c for c in columns if c in df_user.columns]
     if not cols:
         return "<p>(no details available)</p>"
-    def esc(x): 
+    def esc(x):
         return _html.escape("" if pd.isna(x) else str(x))
     thead = "<tr>" + "".join(
         f"<th style='text-align:left;padding:6px 8px;border:1px solid #ccc;background:#f7f7f7'>{esc(c)}</th>"
@@ -435,15 +361,14 @@ def infer_grade(family: str) -> str:
     if family in CONSUMER_FAMILIES: return "CONSUMER"
     return "UNKNOWN"
 
-# ==== UPDATED: Lifespan priors (raise typicals; "3 years is too little") ====
 def typical_lifespan_years(family: str, make: str) -> float:
     f = (family or "").upper()
     m = (make or "").upper()
-    if "SURFACE" in f or "MICROSOFT" in m: return 5.8   # Surface business ~5.5–6
-    if "MACBOOK" in f or "APPLE" in m:     return 6.0   # Macs ~5–7
-    if f in BUSINESS_FAMILIES:             return 5.0   # Business notebooks → 5
-    if f in CONSUMER_FAMILIES:             return 4.0   # Consumer lines → raise from 3 to 4
-    return 5.0  # default more conservative
+    if "SURFACE" in f or "MICROSOFT" in m: return 5.8
+    if "MACBOOK" in f or "APPLE" in m:     return 6.0
+    if f in BUSINESS_FAMILIES:             return 5.0
+    if f in CONSUMER_FAMILIES:             return 4.0
+    return 5.0
 
 def normalize_itemtype(x: Union[str, float, None]) -> str:
     if pd.isna(x): return ""
@@ -459,7 +384,7 @@ def immediate_replacement_flag(row: pd.Series) -> int:
     """
     Immediate replacement if:
       - AGE >= 5 years
-      - ITEMTYPE == 'Client Service Equipment' (case-insensitive)
+      - ITEMTYPE == 'Client Service Equipment'
     """
     age_ok = False
     if "AGE" in row and pd.notna(row["AGE"]):
@@ -471,7 +396,6 @@ def immediate_replacement_flag(row: pd.Series) -> int:
     is_service_equip = (itype == "CLIENT SERVICE EQUIPMENT")
     return int(age_ok and is_service_equip)
 
-# ==== NEW: split out the two dates we will show on UI ====
 def warranty_predicted_date(row):
     exp = pd.to_datetime(row.get("EXPDATE"), errors="coerce")
     if pd.isna(exp):
@@ -479,33 +403,21 @@ def warranty_predicted_date(row):
     return exp.normalize()
 
 def upper_bound_years_for_row(row: pd.Series) -> float:
-    """
-    Upper bound rule:
-      - Client Service Equipment: 5 years (hard cap)
-      - Laptops/Notebooks/MacBooks: 5 years (your preference)
-      - Else: fallback to typical lifespan (already raised)
-    """
     itype = normalize_itemtype(row.get("ITEMTYPE"))
     if itype == "CLIENT SERVICE EQUIPMENT":
         return 5.0
     if is_laptop_row(row):
         return 5.0
-    # non-laptop peripherals: use typical model-based prior
     fam = infer_family(str(row.get("MODEL") or ""))
     make = str(row.get("MAKE") or "")
     return typical_lifespan_years(fam, make)
 
 def upper_bound_predicted_date(row: pd.Series) -> Optional[pd.Timestamp]:
-    """
-    According to upper bound → min( purchase + UB years , today + remaining from AGE )
-    """
     ub_years = upper_bound_years_for_row(row)
     pur = pd.to_datetime(row.get("PURDATE"), errors="coerce")
     today = pd.Timestamp.today().normalize()
-
     if pd.notna(pur):
         return (pur + pd.DateOffset(days=int(ub_years * 365.25))).normalize()
-    # If no purchase date, estimate from AGE
     age_val = row.get("AGE")
     if pd.notna(age_val):
         try:
@@ -516,10 +428,6 @@ def upper_bound_predicted_date(row: pd.Series) -> Optional[pd.Timestamp]:
     return None
 
 def predicted_replacement_date(row: pd.Series) -> Optional[pd.Timestamp]:
-    """
-    Final PREDICTED date used for 'Remaining days'
-      → earliest of (warranty line, upper-bound line).
-    """
     w = warranty_predicted_date(row)
     u = upper_bound_predicted_date(row)
     candidates = [d for d in [w, u] if d is not None and pd.notna(d)]
@@ -530,9 +438,7 @@ def remaining_days_until(dt_target: Optional[pd.Timestamp]) -> Optional[float]:
         return None
     return (dt_target.normalize() - pd.Timestamp.today().normalize()).days
 
-# ==== ML feature engineering & training (unchanged logic, but uses raised priors) ====
 def compute_rule_replacement_date(row: pd.Series) -> Optional[pd.Timestamp]:
-    """Rule-based target: min(typical lifespan date, EXPDATE-90d), with AGE fallback."""
     pur = pd.to_datetime(row.get("PURDATE"), errors="coerce")
     exp = pd.to_datetime(row.get("EXPDATE"), errors="coerce")
     fam = infer_family(str(row.get("MODEL","") or ""))
@@ -555,27 +461,21 @@ def compute_rule_replacement_date(row: pd.Series) -> Optional[pd.Timestamp]:
 
 def engineer_ml_features(df_in: pd.DataFrame):
     df = df_in.copy()
-    # Dates (normalize)
     df["PURDATE"] = pd.to_datetime(df["PURDATE"], errors="coerce") if "PURDATE" in df.columns else pd.NaT
     df["EXPDATE"] = pd.to_datetime(df["EXPDATE"], errors="coerce") if "EXPDATE" in df.columns else pd.NaT
-    # Family/grade
     if "MODEL" not in df.columns: df["MODEL"] = np.nan
     df["family"] = df["MODEL"].apply(infer_family)
     df["grade"]  = df["family"].apply(infer_grade)
-    # AGE (use provided or compute from PURDATE)
     if "AGE" not in df.columns or df["AGE"].isna().all():
         today = pd.Timestamp.today().normalize()
         df["AGE"] = ((today - df["PURDATE"]).dt.days / 365.25).round(2)
-    # Warranty features from EXPDATE
     today = pd.Timestamp.today().normalize()
     df["DAYS_TO_WARRANTY_END"] = (df["EXPDATE"] - today).dt.days
     df["IN_WARRANTY"] = (df["DAYS_TO_WARRANTY_END"] >= 0).astype("Int64").fillna(0).astype(int)
-    # Rule replacement target and bootstrap label
     df["RULE_REPLACE_DATE"] = df.apply(compute_rule_replacement_date, axis=1)
     H = 180
     df["RULE_REPLACE_180D"] = (pd.to_datetime(df["RULE_REPLACE_DATE"]) - today).dt.days.le(H).fillna(False).astype(int)
 
-    # Feature lists (only those present)
     cat_cols = [c for c in ["MAKE","MODEL","family","grade","SUBCAT","ITEMTYPE","CITY","COUNTRY","STATUS","BU","PROJECT","PRJNAME"] if c in df.columns]
     num_cols = [c for c in ["AGE","DAYS_TO_WARRANTY_END","IN_WARRANTY"] if c in df.columns]
     return df, cat_cols, num_cols
@@ -585,6 +485,9 @@ def train_bootstrap_model(df_feats: pd.DataFrame, cat_cols: list[str], num_cols:
     dfm = df_feats.dropna(subset=[target_col])
     if dfm.empty:
         raise ValueError("No rows available to train.")
+
+    if num_cols:
+        dfm[num_cols] = dfm[num_cols].fillna(0)
 
     X = dfm[cat_cols + num_cols]
     y = dfm[target_col].astype(int)
@@ -613,46 +516,56 @@ def train_bootstrap_model(df_feats: pd.DataFrame, cat_cols: list[str], num_cols:
     best_name = max(scores, key=lambda k: (scores[k]["ap"], scores[k]["auc"]))
     return best_name, scores[best_name]["model"], scores
 
-# ---------- Sidebar: Source & Load (REPLACED, SINGLE SOURCE OF TRUTH) ----------
+# =========================
+# SINGLE SOURCE OF TRUTH: Data loading (UPLOAD or PATH), cached by bytes+sheet
+# =========================
 st.sidebar.header("📄 Data Source")
 
-import hashlib
-import io
-import os
+_EXCEL_PATH_KEY = "excel_path"
+_ASSET_UPLOAD_KEY = "asset_file"
+
+if _EXCEL_PATH_KEY not in st.session_state:
+    st.session_state[_EXCEL_PATH_KEY] = DEFAULT_EXCEL_PATH
 
 def _on_upload_change():
-    # Clear all cached data whenever a new file is selected
     st.cache_data.clear()
-    # Also clear any derived state (e.g., trained model) that depends on the data
     for k in ["_asset_model"]:
         st.session_state.pop(k, None)
+    uploaded_now = st.session_state.get(_ASSET_UPLOAD_KEY)
+    if uploaded_now is not None:
+        st.session_state[_EXCEL_PATH_KEY] = ""  # auto-clear path on upload
+    st.rerun()
 
 uploaded = st.sidebar.file_uploader(
     "Upload an Excel file (.xlsx)",
     type=["xlsx"],
-    help="Upload overrides the path input",
-    key="asset_file",
+    help="Uploading a file automatically clears the path input below.",
+    key=_ASSET_UPLOAD_KEY,
     on_change=_on_upload_change,
 )
 
-excel_path = st.sidebar.text_input("Or provide Excel file path")
+# Optional: clear upload button
+if st.session_state.get(_ASSET_UPLOAD_KEY) is not None:
+    if st.sidebar.button("🧹 Clear uploaded file"):
+        st.session_state[_ASSET_UPLOAD_KEY] = None
+        st.cache_data.clear()
+        if not st.session_state.get(_EXCEL_PATH_KEY):
+            st.session_state[_EXCEL_PATH_KEY] = DEFAULT_EXCEL_PATH
+        st.rerun()
 
-# ---- Helpers that ONLY work from bytes ----
+st.sidebar.text_input(
+    "Or provide Excel file path",
+    key=_EXCEL_PATH_KEY,
+)
+
 def read_excel_sheets_from_bytes(file_bytes) -> list[str]:
     return pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl").sheet_names
 
 @st.cache_data(show_spinner=True)
 def load_data_fixed(file_bytes: bytes, sheet_name: str):
-    """
-    Single, canonical loader for the whole app.
-    - Always read from a fresh BytesIO
-    - Streamlit cache is keyed on (file_bytes, sheet_name) automatically
-    - Performs all your normalization and detection
-    """
     df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, engine="openpyxl")
     df = normalize_columns(df)
 
-    # Auto-detect key columns
     user_col = guess_column(df, USER_CANDIDATES)
     age_col = guess_column(df, AGE_CANDIDATES)
     purchase_col = guess_column(df, PURCHASE_DATE_CANDIDATES)
@@ -660,23 +573,19 @@ def load_data_fixed(file_bytes: bytes, sheet_name: str):
     serial_id_col = guess_column(df, SERIAL_ID_CANDIDATES)
     email_col = guess_column(df, EMAIL_CANDIDATES)
 
-    # Fallback for user_col to EMPNAME/EMPID if no user-like column detected
     if user_col is None:
         if "EMPNAME" in df.columns:
             user_col = "EMPNAME"
         elif "EMPID" in df.columns:
             user_col = "EMPID"
 
-    # Compute AGE from purchase date if needed
     if age_col is None and purchase_col is not None:
         df = compute_age_from_purchase_date(df, purchase_col, out_col="AGE")
         age_col = "AGE"
 
-    # Ensure numeric AGE if present
     if age_col and age_col in df.columns:
         df[age_col] = to_numeric_safe(df[age_col])
 
-    # Clean text columns (keep case for names/emails)
     text_cols_to_clean = [
         "MAKE","MODEL","CITY","COUNTRY","SUBLOC","LEVEL","LOCNAME","SEATNO","STATUS",
         "USER","ASSIGNEE","ASSIGNED_TO","OWNER","CAT","EMPNAME","EMPID","SUBCAT","ITEMTYPE"
@@ -686,7 +595,6 @@ def load_data_fixed(file_bytes: bytes, sheet_name: str):
     text_cols_to_clean = [c for c in text_cols_to_clean if c in df.columns]
     df = normalize_text_columns(df, text_cols_to_clean)
 
-    # Standardize values on key categoricals (upper)
     categorical_value_cols = ["MAKE","MODEL","SUBCAT","ITEMTYPE","CITY","COUNTRY","STATUS","LOCNAME","SUBLOC","LEVEL","CAT"]
     df = standardize_value_case(df, [c for c in categorical_value_cols if c in df.columns], mode="upper")
 
@@ -700,7 +608,7 @@ def load_data_fixed(file_bytes: bytes, sheet_name: str):
         "email_col": email_col,
     }
 
-# ---- Read sheet names (bytes-first), then load
+# Determine source & read sheet names (UPLOAD takes priority)
 file_bytes = None
 file_label = None
 sheet_names = []
@@ -710,23 +618,28 @@ try:
         file_bytes = uploaded.getvalue()
         file_label = uploaded.name
         sheet_names = read_excel_sheets_from_bytes(file_bytes)
-    elif os.path.exists(excel_path):
-        with open(excel_path, "rb") as f:
-            file_bytes = f.read()
-        file_label = os.path.basename(excel_path)
-        sheet_names = read_excel_sheets_from_bytes(file_bytes)
     else:
-        st.sidebar.info("Upload a file or provide a valid path to continue.")
+        excel_path = st.session_state[_EXCEL_PATH_KEY].strip()
+        if excel_path and os.path.exists(excel_path):
+            with open(excel_path, "rb") as f:
+                file_bytes = f.read()
+            file_label = os.path.basename(excel_path)
+            sheet_names = read_excel_sheets_from_bytes(file_bytes)
+        elif excel_path:
+            st.sidebar.warning("The provided path does not exist. Upload a file or correct the path.")
+        else:
+            st.sidebar.info("Upload a file or provide a valid path to continue.")
 except Exception as e:
-    st.sidebar.error(f"Failed to read Excel metadata: {e}")
+    st.sidebar.error(f"Could not read sheet names: {e}")
 
-# Sheet select
+# Sheet selection
 if sheet_names:
     sheet = st.sidebar.selectbox("Sheet", options=sheet_names, index=0)
 else:
-    sheet = st.sidebar.text_input("Sheet (name or index)", value=str(DEFAULT_SHEET_NAME))
+    sheet_in = st.sidebar.text_input("Sheet name or index", value=str(DEFAULT_SHEET_NAME))
+    sheet = int(sheet_in) if sheet_in.isdigit() else sheet_in
 
-# Final load
+# Final load (stop app if no dataset)
 if file_bytes is not None:
     try:
         data = load_data_fixed(file_bytes, sheet)
@@ -738,7 +651,6 @@ if file_bytes is not None:
         serial_id_col = data["serial_id_col"]
         email_col = data["email_col"]
 
-        # Debug badge + success message
         md5 = hashlib.md5(file_bytes).hexdigest()[:8]
         st.sidebar.success(f"Loaded {len(df):,} rows")
         with st.sidebar.expander("Dataset info", expanded=False):
@@ -753,19 +665,7 @@ if file_bytes is not None:
         st.sidebar.error(f"Failed to load Excel: {e}")
         st.stop()
 else:
-    st.stop()  # Stop the app until a valid dataset is loaded
-
-st.sidebar.success(f"Loaded {len(df):,} rows")
-
-with st.sidebar.expander("Detected columns (auto)", expanded=False):
-    st.write({
-        "User column": user_col,
-        "Age column": age_col,
-        "Purchase date column": purchase_col,
-        "Asset ID column": asset_id_col,
-        "Serial ID column": serial_id_col,
-        "Email column": email_col,
-    })
+    st.stop()
 
 # ---------- Column mapping overrides ----------
 with st.sidebar.expander("🔧 Column mapping (override auto-detect)", expanded=False):
@@ -803,7 +703,7 @@ with st.sidebar.expander("🔧 Column mapping (override auto-detect)", expanded=
         asset_id_col = asset_override
     else:
         if (asset_id_col is None) or (asset_id_col not in df.columns):
-            for candidate in ["ASSETNO", "SRNO", "SERIAL", "SERIAL_NO", "SERIALNUMBER", "ASSET_NO", "ASSET_NUMBER", "ASSET_ID"]:
+            for candidate in ["ASSETNO","SRNO","SERIAL","SERIAL_NO","SERIALNUMBER","ASSET_NO","ASSET_NUMBER","ASSET_ID"]:
                 if candidate in df.columns:
                     asset_id_col = candidate
                     break
@@ -827,8 +727,10 @@ with c4:
     else:
         st.metric("Avg Age (yrs)", "—")
 
-# ---------- Tabs (w/ ML) ----------
-tab_table, tab_charts, tab_summary, tab_ml = st.tabs(["📋 Table", "📊 Charts", "ℹ️ Summary", "🤖 ML Predictions"])
+# ---------- Tabs (w/ ML + Emails) ----------
+tab_table, tab_charts, tab_summary, tab_ml, tab_emails = st.tabs([
+    "📋 Table", "📊 Charts", "ℹ️ Summary", "🤖 ML Predictions", "✉️ Emails to be Sent"
+])
 
 # ---------- Sidebar: Filters & Actions ----------
 st.sidebar.header("🎛️ Filters & Actions")
@@ -905,18 +807,16 @@ for col, vals in [
         filtered = filtered[filtered[col].isin(vals)]
 
 filtered = keyword_search(filtered, query, search_cols)
-
 st.caption(f"Filtered rows (ALL assets): {len(filtered):,} / {len(df):,}")
 
-# ==== UPDATED: Policy columns on the current filtered view ====
+# ==== Policy columns on the current filtered view ====
 work = filtered.copy()
-work["WARRANTY_PREDICTED_DATE"] = work.apply(warranty_predicted_date, axis=1)     # According to warranty
-work["UPPER_BOUND_DATE"]       = work.apply(upper_bound_predicted_date, axis=1)   # According to 5y cap (or typical)
-work["PREDICTED_REPLACE_DATE"] = work.apply(predicted_replacement_date, axis=1)   # earliest of the above
+work["WARRANTY_PREDICTED_DATE"] = work.apply(warranty_predicted_date, axis=1)
+work["UPPER_BOUND_DATE"]       = work.apply(upper_bound_predicted_date, axis=1)
+work["PREDICTED_REPLACE_DATE"] = work.apply(predicted_replacement_date, axis=1)
 work["REMAINING_DAYS"]         = work["PREDICTED_REPLACE_DATE"].apply(remaining_days_until)
 work["IMMEDIATE_REPLACE"]      = work.apply(immediate_replacement_flag, axis=1)
 
-# Owner/assignee column for display
 owner_display_col = data["user_col"] if (data["user_col"] and data["user_col"] in work.columns) else ("EMPNAME" if "EMPNAME" in work.columns else None)
 
 # ---------- Tabs Logic ----------
@@ -927,26 +827,23 @@ if action == "All assets":
 
 elif action == "All users → all assets (grouped)":
     with tab_table:
-        section_header(
-            "All users → all assets (grouped)",
-            "Only users with ≥2 assets are shown below. Use filters in the sidebar to narrow scope."
+        section_header("All users → all assets (grouped)", "Only users with ≥2 assets are shown below. Use filters to narrow scope.")
+    if not user_col or user_col not in filtered.columns:
+        with tab_table: st.warning("User column not detected. Map it in the sidebar.")
+        result = filtered.head(0)
+    elif not asset_id_col or asset_id_col not in filtered.columns:
+        with tab_table: st.warning("Asset ID column not detected. Map it in the sidebar.")
+        result = filtered.head(0)
+    else:
+        summary = (
+            filtered.groupby(user_col, dropna=False)[asset_id_col]
+            .nunique()
+            .reset_index(name="ASSET_COUNT")
+            .sort_values(["ASSET_COUNT", user_col], ascending=[False, True])
         )
+        view_summary = summary.query("ASSET_COUNT >= 2").copy()
 
-        if not user_col or user_col not in filtered.columns:
-            st.warning("User column not detected. Use the 'Column mapping' override to select EMPNAME/USER/etc.")
-            result = filtered.head(0)
-        elif not asset_id_col or asset_id_col not in filtered.columns:
-            st.warning("Asset ID column not detected. Use the 'Column mapping' override to select ASSETNO/SRNO/SERIAL.")
-            result = filtered.head(0)
-        else:
-            summary = (
-                filtered.groupby(user_col, dropna=False)[asset_id_col]
-                .nunique()
-                .reset_index(name="ASSET_COUNT")
-                .sort_values(["ASSET_COUNT", user_col], ascending=[False, True])
-            )
-            view_summary = summary.query("ASSET_COUNT >= 2").copy()
-
+        with tab_table:
             with card():
                 c1, c2, c3 = st.columns([1,1,2])
                 with c1: st.metric("Users (≥2 assets)", f"{len(view_summary):,}")
@@ -963,7 +860,7 @@ elif action == "All users → all assets (grouped)":
             base_cols_for_email = [c for c in base_cols_for_email if c and c in df_sorted.columns]
 
             st.markdown("#### Details by user (≥2 assets)")
-            st.caption("Each user has two tabs: **Assets** (full table) and **Email** (ready to copy / download .EML).")
+            st.caption("Each user has two tabs: **Assets** (full table) and **Email** (.eml download).")
 
             for i, (_, row) in enumerate(view_summary.iterrows()):
                 u = row[user_col]
@@ -1035,10 +932,10 @@ elif action == "Users with multiple assets":
     with tab_table:
         section_header("Users with multiple assets", "Shows a flat table of all rows for users who own ≥2 unique assets.")
     if not user_col or user_col not in filtered.columns:
-        with tab_table: st.warning("User column not detected. Use the 'Column mapping' override to select EMPNAME/USER/etc.")
+        with tab_table: st.warning("User column not detected. Map it in the sidebar.")
         result = filtered.head(0)
     elif not asset_id_col or asset_id_col not in filtered.columns:
-        with tab_table: st.warning("Asset ID column not detected. Use the 'Column mapping' override to select ASSETNO/SRNO/SERIAL.")
+        with tab_table: st.warning("Asset ID column not detected. Map it in the sidebar.")
         result = filtered.head(0)
     else:
         counts = (filtered.groupby(user_col, dropna=False)[asset_id_col].nunique().reset_index(name="ASSET_COUNT"))
@@ -1077,7 +974,6 @@ else:
 
 # ---------- TABLE TAB: per-asset panel + display & export ----------
 with tab_table:
-    # Per-asset details & predictions
     section_header("Asset Details + Predictions", "Pick an asset to see owner and the two prediction lines.")
     selector_id_col = None
     for cand in [asset_id_col, "ASSETNO", "SRNO", "SERIAL", "ASSET_ID", "ASSET_NUMBER"]:
@@ -1097,16 +993,19 @@ with tab_table:
                 with c1:
                     st.metric("Final predicted date (earliest)", str(r.get("PREDICTED_REPLACE_DATE") or "—"))
                 with c2:
-                    rd = r.get("REMAINING_DAYS")
-                    st.metric("Remaining days", "—" if rd is None else f"{int(rd)}")
+                    rd_val = r.get("REMAINING_DAYS")
+                    st.metric("Remaining days", "—" if rd_val is None or pd.isna(rd_val) else f"{int(rd_val)}")
                 with c3:
-                    st.metric("Immediate replacement?", "Yes ✅" if int(r.get("IMMEDIATE_REPLACE") or 0) == 1 else "No")
+                    irep = r.get("IMMEDIATE_REPLACE")
+                    irep = 0 if pd.isna(irep) else int(irep)
+                    st.metric("Immediate replacement?", "Yes ✅" if irep == 1 else "No")
 
-                # ==== NEW: show the two lines explicitly ====
                 wline = r.get("WARRANTY_PREDICTED_DATE")
                 uline = r.get("UPPER_BOUND_DATE")
-                st.write(f"**According to warranty** (EXPDATE − 90 days): {wline if pd.notna(wline) else '—'}")
-                st.write(f"**According to upper bound** (~5 years): {uline if pd.notna(uline) else '—'}")
+                wline = None if pd.isna(wline) else wline
+                uline = None if pd.isna(uline) else uline
+                st.write(f"**According to warranty** (EXPDATE − 90 days): {wline if wline is not None else '—'}")
+                st.write(f"**According to upper bound** (~5 years): {uline if uline is not None else '—'}")
 
                 st.write("**Current owner**:", owner_val or "—")
                 detail_cols = [c for c in [
@@ -1138,7 +1037,7 @@ with tab_table:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-# ---------- CHARTS TAB (values are now standardized to UPPER) ----------
+# ---------- CHARTS TAB ----------
 with tab_charts:
     section_header("Key Visuals")
     c1, c2 = st.columns(2)
@@ -1232,8 +1131,11 @@ with tab_summary:
 with tab_ml:
     section_header("Near‑Refresh Predictions (ML)")
 
-    target_df = filtered.copy()  # or use df to train/score on entire fleet
+    target_df = filtered.copy()
     df_feats, cat_cols, num_cols = engineer_ml_features(target_df)
+
+    if num_cols:
+        df_feats[num_cols] = df_feats[num_cols].fillna(0)
 
     if st.button("Train model (bootstrap)", type="primary"):
         try:
@@ -1249,7 +1151,10 @@ with tab_ml:
     if "_asset_model" in st.session_state:
         model, cat_cols, num_cols = st.session_state["_asset_model"]
         try:
-            probs = model.predict_proba(df_feats[cat_cols + num_cols])[:,1]
+            feats_for_scoring = df_feats[cat_cols + num_cols].copy()
+            if num_cols:
+                feats_for_scoring[num_cols] = feats_for_scoring[num_cols].fillna(0)
+            probs = model.predict_proba(feats_for_scoring)[:,1]
             preds = (probs >= 0.5).astype(int)
         except Exception as ex:
             st.error(f"Scoring failed: {ex}")
@@ -1282,6 +1187,8 @@ with tab_ml:
         if use_ml:
             work_ml = work.copy()
             df_feats_all, cc, nn = engineer_ml_features(work_ml)
+            if nn:
+                df_feats_all[nn] = df_feats_all[nn].fillna(0)
             work_ml["_ML_PROB"] = model.predict_proba(df_feats_all[cc + nn])[:,1]
             ml_mask = work_ml["_ML_PROB"] >= 0.60
             combined = work_ml[(work_ml["IMMEDIATE_REPLACE"] == 1) | (ml_mask)].copy()
@@ -1292,3 +1199,199 @@ with tab_ml:
             st.dataframe(combined.sort_values(["IMMEDIATE_REPLACE","_ML_PROB"], ascending=[False,False])[cols_to_show],
                          use_container_width=True, height=300)
 
+# ---------- EMAILS TAB ----------
+with tab_emails:
+    section_header("Emails to be Sent", "Generate .eml drafts for two workflows. Uses the current filters above.")
+
+    # ---------------------------
+    # A) All users → all assets (grouped; users with ≥2 unique assets)
+    # ---------------------------
+    st.markdown("## 👥 All users → all assets (grouped)")
+    if not user_col or user_col not in filtered.columns:
+        st.warning("User column not detected. Use the 'Column mapping' overrides in the sidebar to select EMPNAME/USER/etc.")
+    elif not asset_id_col or asset_id_col not in filtered.columns:
+        st.warning("Asset ID column not detected. Use the 'Column mapping' overrides in the sidebar to select ASSETNO/SRNO/SERIAL.")
+    else:
+        candidate_email_cols = [c for c in [email_col, "EMAIL","WORK_EMAIL","USER_EMAIL","E_MAIL"] if c and c in filtered.columns]
+        if not candidate_email_cols:
+            candidate_email_cols = [c for c in filtered.columns if "MAIL" in c.upper() or "EMAIL" in c.upper()]
+        if not candidate_email_cols:
+            st.info("No email-like column found in the current data. Map the email column in the sidebar (🔧 Column mapping).")
+        else:
+            pick_email_col = st.selectbox("Recipient column", options=candidate_email_cols, index=0, key="emails_tab_group_emailcol")
+
+            counts = (filtered.groupby(user_col, dropna=False)[asset_id_col]
+                      .nunique()
+                      .reset_index(name="ASSET_COUNT"))
+            view_users = counts.loc[counts["ASSET_COUNT"] >= 2, user_col].dropna()
+            df_group_scope = filtered[filtered[user_col].isin(view_users)].copy()
+
+            st.caption(f"In scope users (≥2 assets): **{view_users.nunique():,}**")
+            name_like_cols = [c for c in ["EMPNAME","USER","ASSIGNEE","ASSIGNED_TO","OWNER","EMPID"] if c in df_group_scope.columns]
+            name_col = st.selectbox("Name column (for {NAME})", options=["(none)"] + name_like_cols, index=0, key="emails_tab_group_namecol")
+
+            default_subject = "Asset review — items assigned to you"
+            default_body = (
+                "Hi {NAME},\n\n"
+                "Please review the assets under your name and return any that are not in use:\n\n"
+                "{ASSET_TABLE}\n\n"
+                "If any device is in active use, no action is needed.\n"
+                "Otherwise, please return unused items to IT. Thank you!\n\n"
+                "— IT Asset Management"
+            )
+            subj_val = st.text_input("Email subject", value=default_subject, key="emails_tab_group_subject")
+            body_val = st.text_area(
+                "Email body (plain text). Use {NAME} and {ASSET_TABLE} placeholders.",
+                value=default_body, height=160, key="emails_tab_group_body"
+            )
+
+            default_asset_cols = [c for c in ["ASSETNO","SRNO","MAKE","MODEL","SUBCAT","STATUS","CITY","COUNTRY","LOCNAME"] if c in df_group_scope.columns]
+            asset_cols_for_email = st.multiselect(
+                "Columns to include in the asset table",
+                options=list(df_group_scope.columns),
+                default=default_asset_cols,
+                key="emails_tab_group_cols"
+            )
+
+            df_mail = df_group_scope.dropna(subset=[pick_email_col]).copy()
+            if not df_mail.empty:
+                df_mail[pick_email_col] = df_mail[pick_email_col].astype(str).str.strip()
+                df_mail = df_mail[df_mail[pick_email_col] != ""]
+            recipients = (
+                df_mail.groupby(user_col, dropna=False)[pick_email_col]
+                .apply(lambda s: _first_non_null(s))
+                .reset_index(name="_RECIP")
+            )
+            recipients = recipients.dropna(subset=["_RECIP"])
+            st.caption(f"Unique recipients (by user): **{len(recipients):,}**")
+
+            def _name_for_group(df_g):
+                if name_col and name_col in df_g.columns and name_col != "(none)":
+                    v = _first_non_null(df_g[name_col])
+                    return v if v else "there"
+                return "there"
+
+            import zipfile
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for _, rec in recipients.iterrows():
+                    u = rec[user_col]
+                    to_addr = rec["_RECIP"]
+                    df_g = df_mail[df_mail[user_col] == u].copy()
+
+                    ascii_table = make_box_table(df_g, asset_cols_for_email)
+                    rendered_body = body_val.format(NAME=_html.escape(str(_name_for_group(df_g))), ASSET_TABLE=ascii_table)
+
+                    html_table = make_html_table(df_g, asset_cols_for_email)
+                    html_body = f"""
+                    <p>Hi {_html.escape(str(_name_for_group(df_g)))} ,</p>
+                    <p>Please review the assets under your name and return any that are not in use:</p>
+                    {html_table}
+                    <p>If any device is in active use, no action is needed.<br>
+                    Otherwise, please return unused items to IT. Thank you!</p>
+                    <p>— IT Asset Management</p>
+                    """.strip()
+
+                    eml_bytes = build_eml(to_addr, subj_val, html_body, text_fallback=rendered_body)
+                    safe_user = "user" if pd.isna(u) else str(u).strip().replace(" ", "_")
+                    safe_to = str(to_addr).replace("@", "_at_").replace(".", "_")
+                    zf.writestr(f"grouped_{safe_user}_{safe_to}.eml", eml_bytes)
+
+            st.download_button(
+                "⬇️ Download emails (All users ≥2 assets) — ZIP of .eml",
+                data=zip_buf.getvalue(),
+                file_name=f"emails_grouped_{dt.datetime.now():%Y%m%d_%H%M}.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+
+    st.markdown("---")
+
+    # ---------------------------
+    # B) Immediate replacement emails (AGE ≥ 5 & Client Service Equipment)
+    # ---------------------------
+    st.markdown("## ⚠️ Immediate Replacement (AGE ≥ 5 & Client Service Equipment)")
+    imp = work[work["IMMEDIATE_REPLACE"] == 1].copy()
+
+    if imp.empty:
+        st.info("No assets currently meet the immediate replacement policy (AGE ≥ 5 & Client Service Equipment) under current filters.")
+    else:
+        st.caption(f"Assets flagged for immediate replacement: **{len(imp):,}**")
+
+        candidate_email_cols_imp = [c for c in [email_col, "EMAIL","WORK_EMAIL","USER_EMAIL","E_MAIL"] if c and c in imp.columns]
+        if not candidate_email_cols_imp:
+            candidate_email_cols_imp = [c for c in imp.columns if "MAIL" in c.upper() or "EMAIL" in c.upper()]
+        if not candidate_email_cols_imp:
+            st.info("No email-like column found for immediate replacement set. Map the email column in the sidebar (🔧 Column mapping).")
+        else:
+            pick_email_col_imp = st.selectbox("Recipient column (Immediate Replacement)", options=candidate_email_cols_imp, index=0, key="emails_tab_imp_emailcol")
+
+            name_like_cols_imp = [c for c in ["EMPNAME","USER","ASSIGNEE","ASSIGNED_TO","OWNER","EMPID"] if c in imp.columns]
+            name_col_imp = st.selectbox("Name column (for {NAME})", options=["(none)"] + name_like_cols_imp, index=0, key="emails_tab_imp_namecol")
+
+            default_subject_imp = "Immediate replacement required — asset(s) assigned to you"
+            default_body_imp = (
+                "Hi {NAME},\n\n"
+                "The following asset(s) assigned to you exceed our policy (AGE ≥ 5 & Client Service Equipment) and require immediate replacement/return:\n\n"
+                "{ASSET_TABLE}\n\n"
+                "Please coordinate with IT to return or replace these devices.\n\n"
+                "— IT Asset Management"
+            )
+            subj_val_imp = st.text_input("Email subject (Immediate Replacement)", value=default_subject_imp, key="emails_tab_imp_subject")
+            body_val_imp = st.text_area(
+                "Email body (plain text). Use {NAME} and {ASSET_TABLE} placeholders.",
+                value=default_body_imp, height=160, key="emails_tab_imp_body"
+            )
+
+            default_cols_imp = [c for c in [
+                "ASSETNO","SRNO","MAKE","MODEL","ITEMTYPE","SUBCAT","STATUS","CITY","COUNTRY",
+                "AGE","PREDICTED_REPLACE_DATE","REMAINING_DAYS"
+            ] if c in imp.columns]
+            asset_cols_for_email_imp = st.multiselect(
+                "Columns to include in the asset table (Immediate Replacement)",
+                options=list(imp.columns),
+                default=default_cols_imp,
+                key="emails_tab_imp_cols"
+            )
+
+            df_imp_mail = imp.dropna(subset=[pick_email_col_imp]).copy()
+            if not df_imp_mail.empty:
+                df_imp_mail[pick_email_col_imp] = df_imp_mail[pick_email_col_imp].astype(str).str.strip()
+                df_imp_mail = df_imp_mail[df_imp_mail[pick_email_col_imp] != ""]
+            recips_imp = df_imp_mail[pick_email_col_imp].unique().tolist()
+            st.caption(f"Recipients (Immediate Replacement): **{len(recips_imp):,}**")
+
+            def _name_for_group_imp(df_g):
+                if name_col_imp and name_col_imp in df_g.columns and name_col_imp != "(none)":
+                    v = _first_non_null(df_g[name_col_imp])
+                    return v if v else "there"
+                return "there"
+
+            import zipfile
+            zip_buf_imp = io.BytesIO()
+            with zipfile.ZipFile(zip_buf_imp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for em in recips_imp:
+                    df_g = df_imp_mail[df_imp_mail[pick_email_col_imp] == em].copy()
+                    ascii_table = make_box_table(df_g, asset_cols_for_email_imp)
+                    rendered_body = body_val_imp.format(NAME=_html.escape(str(_name_for_group_imp(df_g))), ASSET_TABLE=ascii_table)
+
+                    html_table = make_html_table(df_g, asset_cols_for_email_imp)
+                    html_body = f"""
+                    <p>Hi {_html.escape(str(_name_for_group_imp(df_g)))} ,</p>
+                    <p>The following asset(s) assigned to you exceed our policy (AGE ≥ 5 & Client Service Equipment) and require immediate replacement/return:</p>
+                    {html_table}
+                    <p>Please coordinate with IT to return or replace these devices.</p>
+                    <p>— IT Asset Management</p>
+                    """.strip()
+
+                    eml_bytes = build_eml(em, subj_val_imp, html_body, text_fallback=rendered_body)
+                    safe_em = em.replace("@", "_at_").replace(".", "_")
+                    zf.writestr(f"immediate_replacement_{safe_em}.eml", eml_bytes)
+
+            st.download_button(
+                "⬇️ Download emails (Immediate Replacement) — ZIP of .eml",
+                data=zip_buf_imp.getvalue(),
+                file_name=f"emails_immediate_replacement_{dt.datetime.now():%Y%m%d_%H%M}.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
